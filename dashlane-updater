@@ -22,7 +22,7 @@ import urllib.parse
 from collections import Counter
 from datetime import datetime, timezone
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 DATE_FIELDS = [
     "modificationDatetime",
@@ -30,6 +30,9 @@ DATE_FIELDS = [
     "lastBackupTime",
     "creationDatetime",
 ]
+
+# Below this Dashlane strength score (0-100), a password counts as weak.
+WEAK_STRENGTH = 60
 
 
 # ---------------------------------------------------------------- vault I/O
@@ -62,6 +65,13 @@ def parse_timestamp(value):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
+def parse_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def last_changed(cred):
     for field in DATE_FIELDS:
         dt = parse_timestamp(cred.get(field))
@@ -70,7 +80,12 @@ def last_changed(cred):
     return None
 
 
-def password_strength_issues(password):
+def password_strength_issues(password, strength):
+    """Prefer Dashlane's own 0-100 strength score; fall back to a heuristic."""
+    if strength is not None:
+        if strength < WEAK_STRENGTH:
+            return [f"Dashlane strength {strength}/100"]
+        return []
     issues = []
     if len(password) < 12:
         issues.append(f"short ({len(password)} chars)")
@@ -85,7 +100,7 @@ def password_strength_issues(password):
     return issues
 
 
-def analyze(creds, stale_days):
+def analyze(creds, stale_days, dead_days):
     """Reduce raw credentials to password-free rows with issue flags."""
     now = datetime.now(timezone.utc)
     hash_counts = Counter()
@@ -97,6 +112,7 @@ def analyze(creds, stale_days):
             hash_counts[pw_hash] += 1
 
         changed = last_changed(cred)
+        last_use = parse_timestamp(cred.get("lastUse"))
         rows.append({
             "id": cred.get("id") or "",
             "title": cred.get("title") or cred.get("url") or "(untitled)",
@@ -104,8 +120,12 @@ def analyze(creds, stale_days):
             "login": cred.get("email") or cred.get("login") or "",
             "changed": changed,
             "age_days": (now - changed).days if changed else None,
+            "last_use": last_use,
+            "use_days": (now - last_use).days if last_use else None,
+            "number_use": parse_int(cred.get("numberUse")) or 0,
             "pw_hash": pw_hash,
-            "weak": password_strength_issues(password) if password else [],
+            "weak": password_strength_issues(password, parse_int(cred.get("strength")))
+                    if password else [],
             "no_password": not password,
         })
 
@@ -113,8 +133,28 @@ def analyze(creds, stale_days):
         row["reused"] = bool(row["pw_hash"]) and hash_counts[row["pw_hash"]] > 1
         row["stale"] = row["age_days"] is not None and row["age_days"] > stale_days
         del row["pw_hash"]
-        row["flagged"] = row["stale"] or row["reused"] or bool(row["weak"])
+
+        # Likely dead: not used in dead_days, or never used since Dashlane
+        # started tracking usage AND the entry itself is at least that old.
+        if row["use_days"] is not None:
+            row["dead"] = row["use_days"] > dead_days
+        else:
+            row["dead"] = row["age_days"] is not None and row["age_days"] > dead_days
+
+        row["flagged"] = (row["stale"] or row["reused"] or bool(row["weak"])) and not row["dead"]
     return rows
+
+
+def rotation_order(rows):
+    """Most-recently / most-heavily used first — fix what you actually use."""
+    return sorted(
+        rows,
+        key=lambda r: (
+            r["use_days"] if r["use_days"] is not None else 10**6,
+            -r["number_use"],
+            not r["reused"],
+        ),
+    )
 
 
 def change_password_url(url):
@@ -142,43 +182,76 @@ def suggestion_for(row):
     return "; ".join(reasons)
 
 
+def last_used_label(row):
+    if row["last_use"] is None:
+        return "never (untracked)"
+    return f"{row['last_use'].date()} ({row['use_days']}d ago)"
+
+
 def cmd_audit(args):
-    rows = analyze(fetch_credentials(), args.days)
-    flagged = sorted(
-        (r for r in rows if r["flagged"]),
-        key=lambda r: (-(r["reused"]), -(r["age_days"] or 0)),
+    rows = analyze(fetch_credentials(), args.days, args.dead_days)
+    flagged = rotation_order([r for r in rows if r["flagged"]])
+    dead = sorted(
+        (r for r in rows if r["dead"]),
+        key=lambda r: (r["use_days"] if r["use_days"] is not None else 10**6),
+        reverse=True,
     )
     now = datetime.now(timezone.utc)
 
     lines = [
         f"# Dashlane password audit — {now.date()}",
         "",
-        f"Credentials scanned: **{len(rows)}**, needing attention: **{len(flagged)}**",
-        f"(staleness threshold: {args.days} days)",
+        f"Credentials scanned: **{len(rows)}**",
+        "",
+        f"- Needing rotation: **{len(flagged)}** (staleness threshold: {args.days} days)",
+        f"- Likely dead accounts: **{len(dead)}** (unused for {args.dead_days}+ days)",
         "",
     ]
-    if not flagged:
+
+    if not flagged and not dead:
         lines.append("Nothing to do — vault looks healthy. 🎉")
-    else:
+
+    if flagged:
         lines += [
-            "| # | Site | Login | Problem | Change password |",
-            "|---|------|-------|---------|-----------------|",
+            "## Rotate these",
+            "",
+            "Ordered by how recently/heavily you use them — fix the ones that",
+            "matter first.",
+            "",
+            "| # | Site | Login | Last used | Problem | Change password |",
+            "|---|------|-------|-----------|---------|-----------------|",
         ]
         for i, r in enumerate(flagged, 1):
             link = change_password_url(r["url"])
             link_md = f"[open]({link})" if link else "—"
             lines.append(
-                f"| {i} | {r['title']} | {r['login']} | {suggestion_for(r)} | {link_md} |"
+                f"| {i} | {r['title']} | {r['login']} | {last_used_label(r)} "
+                f"| {suggestion_for(r)} | {link_md} |"
             )
         lines += [
             "",
-            "## Suggested next step",
+            "Run `dashlane-updater fix` to walk through these one at a time.",
             "",
-            "Run `dashlane-updater fix` to walk through these one at a time:",
-            "it generates a strong password to your clipboard, opens each site's",
-            "change-password page, and verifies the Dashlane extension saved the",
-            "update.",
         ]
+
+    if dead:
+        lines += [
+            "## Likely dead accounts — consider deleting the account instead",
+            "",
+            f"Not used through Dashlane in over {args.dead_days} days (or never).",
+            "Rotating these is usually wasted effort; closing the account removes",
+            "the risk entirely. Entries whose passwords are also reused elsewhere",
+            "are marked — those are worth closing first.",
+            "",
+            "| # | Site | Login | Last used | Times used | Also reused? |",
+            "|---|------|-------|-----------|------------|--------------|",
+        ]
+        for i, r in enumerate(dead, 1):
+            lines.append(
+                f"| {i} | {r['title']} | {r['login']} | {last_used_label(r)} "
+                f"| {r['number_use']} | {'yes' if r['reused'] else ''} |"
+            )
+        lines.append("")
 
     report = "\n".join(lines) + "\n"
     with open(args.output, "w") as f:
@@ -193,7 +266,7 @@ def generate_password(length=20):
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+"
     while True:
         pw = "".join(secrets.choice(alphabet) for _ in range(length))
-        if not password_strength_issues(pw):
+        if not password_strength_issues(pw, None):
             return pw
 
 
@@ -210,23 +283,22 @@ def open_in_browser(url):
 
 
 def cmd_fix(args):
-    rows = analyze(fetch_credentials(), args.days)
-    flagged = sorted(
-        (r for r in rows if r["flagged"]),
-        key=lambda r: (-(r["reused"]), -(r["age_days"] or 0)),
-    )
+    rows = analyze(fetch_credentials(), args.days, args.dead_days)
+    flagged = rotation_order([r for r in rows if r["flagged"]])
     if not flagged:
         print("Nothing to fix — vault looks healthy.")
+        print("(Likely dead accounts are excluded; see `dashlane-updater audit`.)")
         return
 
-    print(f"{len(flagged)} credential(s) to rotate. For each one I'll copy a fresh")
-    print("strong password to your clipboard and open the change-password page.")
-    print("Complete the change in the browser and let the Dashlane extension")
-    print("save the update, then mark it done.\n")
+    print(f"{len(flagged)} credential(s) to rotate, most-used first. For each one")
+    print("I'll copy a fresh strong password to your clipboard and open the")
+    print("change-password page. Complete the change in the browser and let the")
+    print("Dashlane extension save the update, then mark it done.\n")
 
     done_ids = []
     for i, r in enumerate(flagged, 1):
         print(f"[{i}/{len(flagged)}] {r['title']} — {r['login']}")
+        print(f"    last used: {last_used_label(r)}, {r['number_use']} times")
         print(f"    problem: {suggestion_for(r)}")
         url = change_password_url(r["url"])
 
@@ -258,14 +330,14 @@ def cmd_fix(args):
     print("Clipboard cleared.")
 
     if done_ids:
-        verify(done_ids, args.days)
+        verify(done_ids, args.days, args.dead_days)
 
 
-def verify(done_ids, stale_days):
+def verify(done_ids, stale_days, dead_days):
     """Re-fetch the vault and confirm the changed entries actually updated."""
     print(f"\nVerifying {len(done_ids)} change(s) against the vault...")
     subprocess.run(["dcli", "sync"], capture_output=True, text=True)
-    rows = {r["id"]: r for r in analyze(fetch_credentials(), stale_days)}
+    rows = {r["id"]: r for r in analyze(fetch_credentials(), stale_days, dead_days)}
     for cred_id in done_ids:
         r = rows.get(cred_id)
         if r is None:
@@ -279,6 +351,14 @@ def verify(done_ids, stale_days):
 
 # --------------------------------------------------------------------- main
 
+def add_common_args(parser):
+    parser.add_argument("--days", type=int, default=365,
+                        help="flag passwords older than this many days (default 365)")
+    parser.add_argument("--dead-days", type=int, default=730,
+                        help="treat accounts unused for this many days as likely dead "
+                             "(default 730)")
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="dashlane-updater",
@@ -289,15 +369,13 @@ def main():
     sub = ap.add_subparsers(dest="command", required=True)
 
     p_audit = sub.add_parser("audit", help="write a markdown report of suggested fixes")
-    p_audit.add_argument("--days", type=int, default=365,
-                         help="flag passwords older than this many days (default 365)")
+    add_common_args(p_audit)
     p_audit.add_argument("-o", "--output", default="dashlane-audit.md",
                          help="markdown output file (default dashlane-audit.md)")
     p_audit.set_defaults(func=cmd_audit)
 
     p_fix = sub.add_parser("fix", help="interactively rotate flagged passwords")
-    p_fix.add_argument("--days", type=int, default=365,
-                       help="flag passwords older than this many days (default 365)")
+    add_common_args(p_fix)
     p_fix.set_defaults(func=cmd_fix)
 
     args = ap.parse_args()

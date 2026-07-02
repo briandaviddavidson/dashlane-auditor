@@ -1,5 +1,6 @@
 # Generated audit reports (contain site/login metadata)
 report*.md
+dashlane-audit*.md
 *.json
 *.csv
 
