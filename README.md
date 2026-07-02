@@ -25,7 +25,7 @@ around the one step that needs a human.
 ## Install
 
 ```sh
-brew tap YOURUSER/tap
+brew tap briandaviddavidson/tap
 brew install dashlane-updater
 ```
 
@@ -59,9 +59,9 @@ The formula lives in `Formula/dashlane-updater.rb`. To publish:
 
 1. Push this repo to GitHub and tag a release: `git tag v0.1.0 && git push --tags`.
 2. Compute the tarball checksum:
-   `curl -sL https://github.com/YOURUSER/dashlane-updater/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256`
-3. Fill in `YOURUSER` and the `sha256` in the formula.
+   `curl -sL https://github.com/briandaviddavidson/dashlane-auditor/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256`
+3. Fill in the `sha256` in the formula.
 4. Create a tap repo named `homebrew-tap` on GitHub and copy
    `Formula/dashlane-updater.rb` into its `Formula/` directory.
 
-Then anyone can `brew tap YOURUSER/tap && brew install dashlane-updater`.
+Then anyone can `brew tap briandaviddavidson/tap && brew install dashlane-updater`.
