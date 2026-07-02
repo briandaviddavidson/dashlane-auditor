@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""dashlane-updater — audit and rotate stale Dashlane passwords.
+
+Commands:
+    audit   Scan the vault and write a markdown document of suggestions.
+    fix     Walk through flagged credentials one by one: generates a strong
+            password to the clipboard, opens the site's change-password page,
+            and verifies the vault entry was updated afterwards.
+
+Reads credentials via the Dashlane CLI (`dcli`). Passwords are inspected in
+memory only — they are never printed, logged, or written to disk.
+"""
+
+import argparse
+import hashlib
+import json
+import secrets
+import string
+import subprocess
+import sys
+import urllib.parse
+from collections import Counter
+from datetime import datetime, timezone
+
+VERSION = "0.1.0"
+
+DATE_FIELDS = [
+    "modificationDatetime",
+    "userModificationDatetime",
+    "lastBackupTime",
+    "creationDatetime",
+]
+
+
+# ---------------------------------------------------------------- vault I/O
+
+def fetch_credentials():
+    try:
+        proc = subprocess.run(
+            ["dcli", "password", "--output", "json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        sys.exit("dcli not found. Install with: brew install dashlane/tap/dashlane-cli")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"dcli failed (are you logged in? run `dcli sync` in a terminal):\n{e.stderr}")
+    return json.loads(proc.stdout)
+
+
+def parse_timestamp(value):
+    """Dashlane timestamps are unix seconds, sometimes as strings."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts > 1e12:  # guard against milliseconds
+        ts /= 1000
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def last_changed(cred):
+    for field in DATE_FIELDS:
+        dt = parse_timestamp(cred.get(field))
+        if dt:
+            return dt
+    return None
+
+
+def password_strength_issues(password):
+    issues = []
+    if len(password) < 12:
+        issues.append(f"short ({len(password)} chars)")
+    classes = sum((
+        any(c.islower() for c in password),
+        any(c.isupper() for c in password),
+        any(c.isdigit() for c in password),
+        any(not c.isalnum() for c in password),
+    ))
+    if classes < 3:
+        issues.append("low complexity")
+    return issues
+
+
+def analyze(creds, stale_days):
+    """Reduce raw credentials to password-free rows with issue flags."""
+    now = datetime.now(timezone.utc)
+    hash_counts = Counter()
+    rows = []
+    for cred in creds:
+        password = cred.get("password") or ""
+        pw_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
+        if pw_hash:
+            hash_counts[pw_hash] += 1
+
+        changed = last_changed(cred)
+        rows.append({
+            "id": cred.get("id") or "",
+            "title": cred.get("title") or cred.get("url") or "(untitled)",
+            "url": cred.get("url") or "",
+            "login": cred.get("email") or cred.get("login") or "",
+            "changed": changed,
+            "age_days": (now - changed).days if changed else None,
+            "pw_hash": pw_hash,
+            "weak": password_strength_issues(password) if password else [],
+            "no_password": not password,
+        })
+
+    for row in rows:
+        row["reused"] = bool(row["pw_hash"]) and hash_counts[row["pw_hash"]] > 1
+        row["stale"] = row["age_days"] is not None and row["age_days"] > stale_days
+        del row["pw_hash"]
+        row["flagged"] = row["stale"] or row["reused"] or bool(row["weak"])
+    return rows
+
+
+def change_password_url(url):
+    """Best-guess change-password page via the .well-known convention."""
+    if not url:
+        return None
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        return None
+    return f"https://{parsed.netloc}/.well-known/change-password"
+
+
+# -------------------------------------------------------------------- audit
+
+def suggestion_for(row):
+    reasons = []
+    if row["stale"]:
+        reasons.append(f"unchanged for {row['age_days']} days")
+    if row["reused"]:
+        reasons.append("password reused on other accounts")
+    if row["weak"]:
+        reasons.append("weak: " + ", ".join(row["weak"]))
+    return "; ".join(reasons)
+
+
+def cmd_audit(args):
+    rows = analyze(fetch_credentials(), args.days)
+    flagged = sorted(
+        (r for r in rows if r["flagged"]),
+        key=lambda r: (-(r["reused"]), -(r["age_days"] or 0)),
+    )
+    now = datetime.now(timezone.utc)
+
+    lines = [
+        f"# Dashlane password audit — {now.date()}",
+        "",
+        f"Credentials scanned: **{len(rows)}**, needing attention: **{len(flagged)}**",
+        f"(staleness threshold: {args.days} days)",
+        "",
+    ]
+    if not flagged:
+        lines.append("Nothing to do — vault looks healthy. 🎉")
+    else:
+        lines += [
+            "| # | Site | Login | Problem | Change password |",
+            "|---|------|-------|---------|-----------------|",
+        ]
+        for i, r in enumerate(flagged, 1):
+            link = change_password_url(r["url"])
+            link_md = f"[open]({link})" if link else "—"
+            lines.append(
+                f"| {i} | {r['title']} | {r['login']} | {suggestion_for(r)} | {link_md} |"
+            )
+        lines += [
+            "",
+            "## Suggested next step",
+            "",
+            "Run `dashlane-updater fix` to walk through these one at a time:",
+            "it generates a strong password to your clipboard, opens each site's",
+            "change-password page, and verifies the Dashlane extension saved the",
+            "update.",
+        ]
+
+    report = "\n".join(lines) + "\n"
+    with open(args.output, "w") as f:
+        f.write(report)
+    print(report)
+    print(f"Wrote {args.output}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------- fix
+
+def generate_password(length=20):
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+"
+    while True:
+        pw = "".join(secrets.choice(alphabet) for _ in range(length))
+        if not password_strength_issues(pw):
+            return pw
+
+
+def copy_to_clipboard(text):
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
+def open_in_browser(url):
+    subprocess.run(["open", url], check=False)
+
+
+def cmd_fix(args):
+    rows = analyze(fetch_credentials(), args.days)
+    flagged = sorted(
+        (r for r in rows if r["flagged"]),
+        key=lambda r: (-(r["reused"]), -(r["age_days"] or 0)),
+    )
+    if not flagged:
+        print("Nothing to fix — vault looks healthy.")
+        return
+
+    print(f"{len(flagged)} credential(s) to rotate. For each one I'll copy a fresh")
+    print("strong password to your clipboard and open the change-password page.")
+    print("Complete the change in the browser and let the Dashlane extension")
+    print("save the update, then mark it done.\n")
+
+    done_ids = []
+    for i, r in enumerate(flagged, 1):
+        print(f"[{i}/{len(flagged)}] {r['title']} — {r['login']}")
+        print(f"    problem: {suggestion_for(r)}")
+        url = change_password_url(r["url"])
+
+        while True:
+            pw = generate_password()
+            if copy_to_clipboard(pw):
+                print("    new password copied to clipboard")
+            else:
+                print("    WARNING: could not access clipboard (pbcopy failed)")
+            del pw
+            if url:
+                open_in_browser(url)
+                print(f"    opened {url}")
+            else:
+                print("    no URL on this entry — open the site manually")
+
+            choice = input("    [d]one / [r]egenerate / [s]kip / [q]uit: ").strip().lower()
+            if choice == "r":
+                continue
+            break
+
+        if choice == "d":
+            done_ids.append(r["id"])
+        elif choice == "q":
+            break
+        print()
+
+    copy_to_clipboard("")  # don't leave a live password in the clipboard
+    print("Clipboard cleared.")
+
+    if done_ids:
+        verify(done_ids, args.days)
+
+
+def verify(done_ids, stale_days):
+    """Re-fetch the vault and confirm the changed entries actually updated."""
+    print(f"\nVerifying {len(done_ids)} change(s) against the vault...")
+    subprocess.run(["dcli", "sync"], capture_output=True, text=True)
+    rows = {r["id"]: r for r in analyze(fetch_credentials(), stale_days)}
+    for cred_id in done_ids:
+        r = rows.get(cred_id)
+        if r is None:
+            print(f"  ? entry {cred_id} no longer found")
+        elif r["age_days"] is not None and r["age_days"] <= 1:
+            print(f"  ✓ {r['title']} — vault entry updated")
+        else:
+            print(f"  ✗ {r['title']} — vault entry NOT updated; make sure the "
+                  "Dashlane extension saved the new password, or update it manually")
+
+
+# --------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="dashlane-updater",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p_audit = sub.add_parser("audit", help="write a markdown report of suggested fixes")
+    p_audit.add_argument("--days", type=int, default=365,
+                         help="flag passwords older than this many days (default 365)")
+    p_audit.add_argument("-o", "--output", default="dashlane-audit.md",
+                         help="markdown output file (default dashlane-audit.md)")
+    p_audit.set_defaults(func=cmd_audit)
+
+    p_fix = sub.add_parser("fix", help="interactively rotate flagged passwords")
+    p_fix.add_argument("--days", type=int, default=365,
+                       help="flag passwords older than this many days (default 365)")
+    p_fix.set_defaults(func=cmd_fix)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
