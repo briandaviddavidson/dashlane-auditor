@@ -5,6 +5,8 @@ class DashlaneAuditor < Formula
   sha256 "14f77ac162bd50a9a6e8b93ae97ea0c1a95c6a5ed1a20be2673bbbe751acd48a"
   license "MIT"
 
+  include Language::Python::Shebang
+
   depends_on "dashlane/tap/dashlane-cli"
   depends_on "python@3.13"
 
