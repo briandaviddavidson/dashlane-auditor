@@ -1,0 +1,7 @@
+# Generated audit reports (contain site/login metadata)
+report*.md
+*.json
+*.csv
+
+.DS_Store
+__pycache__/
