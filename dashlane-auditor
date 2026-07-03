@@ -20,9 +20,10 @@ import sys
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 DATE_FIELDS = [
     "modificationDatetime",
@@ -100,16 +101,63 @@ def password_strength_issues(password, strength):
     return issues
 
 
-def analyze(creds, stale_days, dead_days):
+def fetch_breach_counts(sha1_hashes):
+    """Look up passwords against HaveIBeenPwned's range API.
+
+    k-anonymity: only the first 5 hex chars of each SHA-1 hash are sent;
+    matching happens locally. Returns {sha1: times_seen_in_breaches}, or
+    None if the service is unreachable (audit proceeds without it).
+    """
+    by_prefix = {}
+    for h in sha1_hashes:
+        by_prefix.setdefault(h[:5], []).append(h)
+
+    def fetch(prefix):
+        req = urllib.request.Request(
+            f"https://api.pwnedpasswords.com/range/{prefix}",
+            headers={"User-Agent": "dashlane-auditor", "Add-Padding": "true"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return prefix, resp.read().decode()
+
+    counts = {}
+    total = len(by_prefix)
+    try:
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            futures = [ex.submit(fetch, p) for p in by_prefix]
+            for i, fut in enumerate(as_completed(futures), 1):
+                prefix, body = fut.result()
+                suffix_counts = {}
+                for line in body.splitlines():
+                    suffix, _, n = line.partition(":")
+                    if n:
+                        suffix_counts[suffix.strip().upper()] = int(n)
+                for h in by_prefix[prefix]:
+                    n = suffix_counts.get(h[5:].upper(), 0)
+                    if n:
+                        counts[h] = n
+                print(f"\r  breach check: {i}/{total} hash prefixes",
+                      end="", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"\n  breach check unavailable ({e.__class__.__name__}); "
+              "continuing without it", file=sys.stderr)
+        return None
+    print(file=sys.stderr)
+    return counts
+
+
+def analyze(creds, stale_days, dead_days, check_breaches=True):
     """Reduce raw credentials to password-free rows with issue flags."""
     now = datetime.now(timezone.utc)
     hash_counts = Counter()
+    sha1_of = {}
     rows = []
     for cred in creds:
         password = cred.get("password") or ""
         pw_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
         if pw_hash:
             hash_counts[pw_hash] += 1
+            sha1_of[pw_hash] = hashlib.sha1(password.encode()).hexdigest().upper()
 
         changed = last_changed(cred)
         last_use = parse_timestamp(cred.get("lastUse"))
@@ -129,9 +177,17 @@ def analyze(creds, stale_days, dead_days):
             "no_password": not password,
         })
 
+    breach_counts = None
+    if check_breaches and sha1_of:
+        breach_counts = fetch_breach_counts(set(sha1_of.values()))
+
     for row in rows:
         row["reused"] = bool(row["pw_hash"]) and hash_counts[row["pw_hash"]] > 1
         row["stale"] = row["age_days"] is not None and row["age_days"] > stale_days
+        if breach_counts is not None and row["pw_hash"]:
+            row["breached"] = breach_counts.get(sha1_of[row["pw_hash"]], 0)
+        else:
+            row["breached"] = None  # unknown (no password or check unavailable)
         del row["pw_hash"]
 
         # Likely dead: not used in dead_days, or never used since Dashlane
@@ -141,7 +197,10 @@ def analyze(creds, stale_days, dead_days):
         else:
             row["dead"] = row["age_days"] is not None and row["age_days"] > dead_days
 
-        row["flagged"] = (row["stale"] or row["reused"] or bool(row["weak"])) and not row["dead"]
+        # Rotate on evidence, not age: breached, reused, or weak.
+        # Staleness alone is reported but doesn't demand action (NIST 800-63B).
+        row["flagged"] = (bool(row["breached"]) or row["reused"] or bool(row["weak"])) \
+            and not row["dead"]
     return rows
 
 
@@ -193,12 +252,14 @@ def change_password_url(url):
 
 def suggestion_for(row):
     reasons = []
-    if row["stale"]:
-        reasons.append(f"unchanged for {row['age_days']} days")
+    if row["breached"]:
+        reasons.append(f"in known breaches ({row['breached']:,}× seen)")
     if row["reused"]:
         reasons.append("password reused on other accounts")
     if row["weak"]:
         reasons.append("weak: " + ", ".join(row["weak"]))
+    if row["stale"]:
+        reasons.append(f"unchanged for {row['age_days']} days")
     return "; ".join(reasons)
 
 
@@ -209,7 +270,8 @@ def last_used_label(row):
 
 
 def cmd_audit(args):
-    rows = analyze(fetch_credentials(), args.days, args.dead_days)
+    rows = analyze(fetch_credentials(), args.days, args.dead_days,
+                   check_breaches=not args.no_breach_check)
     flagged = rotation_order([r for r in rows if r["flagged"]])
     dead = sorted(
         (r for r in rows if r["dead"]),
@@ -218,13 +280,24 @@ def cmd_audit(args):
     )
     now = datetime.now(timezone.utc)
 
+    breach_checked = any(r["breached"] is not None for r in rows)
+    n_breached = sum(1 for r in flagged if r["breached"])
+    n_stale_only = sum(
+        1 for r in rows
+        if r["stale"] and not r["flagged"] and not r["dead"]
+    )
+
     lines = [
         f"# Dashlane password audit — {now.date()}",
         "",
         f"Credentials scanned: **{len(rows)}**",
         "",
-        f"- Needing rotation: **{len(flagged)}** (staleness threshold: {args.days} days)",
+        f"- Needing rotation (breached / reused / weak): **{len(flagged)}**",
+        f"  - of which found in known breaches: "
+        f"**{n_breached if breach_checked else 'unknown — breach check unavailable'}**",
         f"- Likely dead accounts: **{len(dead)}** (unused for {args.dead_days}+ days)",
+        f"- Stale but strong & unique: **{n_stale_only}** — no action needed; "
+        f"modern guidance (NIST 800-63B) says rotate on evidence, not age",
         "",
     ]
 
@@ -260,16 +333,17 @@ def cmd_audit(args):
             "",
             f"Not used through Dashlane in over {args.dead_days} days (or never).",
             "Rotating these is usually wasted effort; closing the account removes",
-            "the risk entirely. Entries whose passwords are also reused elsewhere",
-            "are marked — those are worth closing first.",
+            "the risk entirely. Close breached/reused ones first — their passwords",
+            "are live keys floating around in dumps.",
             "",
-            "| # | Site | Login | Last used | Times used | Also reused? |",
-            "|---|------|-------|-----------|------------|--------------|",
+            "| # | Site | Login | Last used | Times used | Breached? | Reused? |",
+            "|---|------|-------|-----------|------------|-----------|---------|",
         ]
         for i, r in enumerate(dead, 1):
+            breached = f"{r['breached']:,}×" if r["breached"] else ""
             lines.append(
                 f"| {i} | {r['title']} | {r['login']} | {last_used_label(r)} "
-                f"| {r['number_use']} | {'yes' if r['reused'] else ''} |"
+                f"| {r['number_use']} | {breached} | {'yes' if r['reused'] else ''} |"
             )
         lines.append("")
 
@@ -298,7 +372,8 @@ the end of the session.
 
 
 def cmd_fix(args):
-    rows = analyze(fetch_credentials(), args.days, args.dead_days)
+    rows = analyze(fetch_credentials(), args.days, args.dead_days,
+                   check_breaches=not args.no_breach_check)
     flagged = rotation_order([r for r in rows if r["flagged"]])
     if not flagged:
         print("Nothing to fix — vault looks healthy.")
@@ -339,7 +414,9 @@ def verify(done_ids, stale_days, dead_days):
     """Re-fetch the vault and confirm the changed entries actually updated."""
     print(f"\nVerifying {len(done_ids)} change(s) against the vault...")
     subprocess.run(["dcli", "sync"], capture_output=True, text=True)
-    rows = {r["id"]: r for r in analyze(fetch_credentials(), stale_days, dead_days)}
+    rows = {r["id"]: r
+            for r in analyze(fetch_credentials(), stale_days, dead_days,
+                             check_breaches=False)}
     for cred_id in done_ids:
         r = rows.get(cred_id)
         if r is None:
@@ -355,10 +432,14 @@ def verify(done_ids, stale_days, dead_days):
 
 def add_common_args(parser):
     parser.add_argument("--days", type=int, default=365,
-                        help="flag passwords older than this many days (default 365)")
+                        help="report passwords older than this many days as stale "
+                             "(informational; default 365)")
     parser.add_argument("--dead-days", type=int, default=730,
                         help="treat accounts unused for this many days as likely dead "
                              "(default 730)")
+    parser.add_argument("--no-breach-check", action="store_true",
+                        help="skip the HaveIBeenPwned check (k-anonymity: only "
+                             "5-char hash prefixes are ever sent)")
 
 
 def main():

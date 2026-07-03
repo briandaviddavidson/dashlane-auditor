@@ -3,12 +3,16 @@
 Audit and rotate stale Dashlane passwords, semi-automatically.
 
 - **`dashlane-auditor audit`** — reads your vault via the Dashlane CLI and
-  writes a markdown report (`dashlane-audit.md`) of stale, reused, and weak
-  passwords, each with a direct change-password link. Weakness uses Dashlane's
-  own 0–100 strength score where available. Entries unused for `--dead-days`
-  (default 730) go in a separate "likely dead accounts" section with the
-  suggestion to close the account rather than rotate it. Passwords are
-  compared in memory only and never printed or written to disk.
+  writes a markdown report (`dashlane-audit.md`) of passwords needing rotation.
+  Rotation is evidence-based (NIST 800-63B): a password is flagged if it is
+  **breached** (checked against HaveIBeenPwned's range API — k-anonymity, only
+  5-char SHA-1 prefixes ever leave your machine; skip with `--no-breach-check`),
+  **reused** across entries, or **weak** (Dashlane's own 0–100 strength score).
+  Old-but-strong-and-unique passwords are reported as stale but need no action.
+  Entries unused for `--dead-days` (default 730) go in a separate "likely dead
+  accounts" section with the suggestion to close the account rather than rotate
+  it. Passwords are compared in memory only and never printed or written to
+  disk.
 - **`dashlane-auditor fix`** — walks through the flagged credentials one at a
   time, most-recently/heavily used first so the accounts that matter get
   rotated first: opens each site's change-password page (probing the
