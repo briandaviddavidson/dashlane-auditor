@@ -58,9 +58,9 @@ probably don't want in git history.
 
 The formula lives in `Formula/dashlane-auditor.rb`. To publish:
 
-1. Push this repo to GitHub and tag a release: `git tag v0.3.0 && git push --tags`.
+1. Push this repo to GitHub and tag a release: `git tag v0.3.1 && git push --tags`.
 2. Compute the tarball checksum:
-   `curl -sL https://github.com/briandaviddavidson/dashlane-auditor/archive/refs/tags/v0.3.0.tar.gz | shasum -a 256`
+   `curl -sL https://github.com/briandaviddavidson/dashlane-auditor/archive/refs/tags/v0.3.1.tar.gz | shasum -a 256`
 3. Fill in the `sha256` in the formula.
 4. Create a tap repo named `homebrew-tap` on GitHub and copy
    `Formula/dashlane-auditor.rb` into its `Formula/` directory.
