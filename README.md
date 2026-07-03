@@ -11,8 +11,8 @@ Audit and rotate stale Dashlane passwords, semi-automatically.
   compared in memory only and never printed or written to disk.
 - **`dashlane-auditor fix`** — walks through the flagged credentials one at a
   time, most-recently/heavily used first so the accounts that matter get
-  rotated first: opens each site's change-password page (using the
-  `/.well-known/change-password` convention) and tracks your progress. On each
+  rotated first: opens each site's change-password page (probing the
+  `/.well-known/change-password` convention, falling back to the site itself when unsupported) and tracks your progress. On each
   page, use the Dashlane extension itself to fill the current password and
   generate the new one — its generator fills both fields and updates the
   vault automatically, so no password ever touches the clipboard. At the end,
