@@ -3,9 +3,10 @@
 
 Commands:
     audit   Scan the vault and write a markdown document of suggestions.
-    fix     Walk through flagged credentials one by one: generates a strong
-            password to the clipboard, opens the site's change-password page,
-            and verifies the vault entry was updated afterwards.
+    fix     Walk through flagged credentials one by one: opens each site's
+            change-password page (use Dashlane's own overlay to fill the
+            current password and generate the new one), and verifies each
+            vault entry was actually updated afterwards.
 
 Reads credentials via the Dashlane CLI (`dcli`). Passwords are inspected in
 memory only — they are never printed, logged, or written to disk.
@@ -14,15 +15,13 @@ memory only — they are never printed, logged, or written to disk.
 import argparse
 import hashlib
 import json
-import secrets
-import string
 import subprocess
 import sys
 import urllib.parse
 from collections import Counter
 from datetime import datetime, timezone
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 DATE_FIELDS = [
     "modificationDatetime",
@@ -262,24 +261,19 @@ def cmd_audit(args):
 
 # ---------------------------------------------------------------------- fix
 
-def generate_password(length=20):
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+"
-    while True:
-        pw = "".join(secrets.choice(alphabet) for _ in range(length))
-        if not password_strength_issues(pw, None):
-            return pw
-
-
-def copy_to_clipboard(text):
-    try:
-        subprocess.run(["pbcopy"], input=text, text=True, check=True)
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-
-
 def open_in_browser(url):
     subprocess.run(["open", url], check=False)
+
+
+FIX_INSTRUCTIONS = """\
+For each site, do the password change with Dashlane's own overlay:
+  1. In the current-password field, pick the login from Dashlane's dropdown.
+  2. In the new-password field, accept Dashlane's "Generate strong password"
+     suggestion — it fills both fields and remembers the value.
+  3. Submit, then accept Dashlane's prompt to update the saved password.
+Then mark the entry [d]one here. Changes are verified against the vault at
+the end of the session.
+"""
 
 
 def cmd_fix(args):
@@ -290,10 +284,8 @@ def cmd_fix(args):
         print("(Likely dead accounts are excluded; see `dashlane-auditor audit`.)")
         return
 
-    print(f"{len(flagged)} credential(s) to rotate, most-used first. For each one")
-    print("I'll copy a fresh strong password to your clipboard and open the")
-    print("change-password page. Complete the change in the browser and let the")
-    print("Dashlane extension save the update, then mark it done.\n")
+    print(f"{len(flagged)} credential(s) to rotate, most-used first.\n")
+    print(FIX_INSTRUCTIONS)
 
     done_ids = []
     for i, r in enumerate(flagged, 1):
@@ -301,36 +293,24 @@ def cmd_fix(args):
         print(f"    last used: {last_used_label(r)}, {r['number_use']} times")
         print(f"    problem: {suggestion_for(r)}")
         url = change_password_url(r["url"])
+        if url:
+            open_in_browser(url)
+            print(f"    opened {url}")
+            print("    (if that page 404s, log in and look for account/security settings)")
+        else:
+            print("    no URL on this entry — open the site manually")
 
-        while True:
-            pw = generate_password()
-            if copy_to_clipboard(pw):
-                print("    new password copied to clipboard")
-            else:
-                print("    WARNING: could not access clipboard (pbcopy failed)")
-            del pw
-            if url:
-                open_in_browser(url)
-                print(f"    opened {url}")
-            else:
-                print("    no URL on this entry — open the site manually")
-
-            choice = input("    [d]one / [r]egenerate / [s]kip / [q]uit: ").strip().lower()
-            if choice == "r":
-                continue
-            break
-
+        choice = input("    [d]one / [s]kip / [q]uit: ").strip().lower()
         if choice == "d":
             done_ids.append(r["id"])
         elif choice == "q":
             break
         print()
 
-    copy_to_clipboard("")  # don't leave a live password in the clipboard
-    print("Clipboard cleared.")
-
     if done_ids:
         verify(done_ids, args.days, args.dead_days)
+    else:
+        print("No entries marked done.")
 
 
 def verify(done_ids, stale_days, dead_days):
