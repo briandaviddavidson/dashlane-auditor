@@ -23,7 +23,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 DATE_FIELDS = [
     "modificationDatetime",
@@ -217,7 +217,9 @@ def rotation_order(rows):
 
 
 def site_url(url):
-    """Normalize the vault entry's URL to something openable."""
+    """Origin of the vault entry's URL. Stored URLs are often stale deep
+    links (old promos, session pages); the origin is the only part that
+    reliably still exists."""
     if not url:
         return None
     if "://" not in url:
@@ -225,7 +227,7 @@ def site_url(url):
     parsed = urllib.parse.urlparse(url)
     if not parsed.netloc:
         return None
-    return url
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def change_password_url(url):
@@ -362,13 +364,23 @@ def open_in_browser(url):
 
 FIX_INSTRUCTIONS = """\
 For each site, do the password change with Dashlane's own overlay:
-  1. In the current-password field, pick the login from Dashlane's dropdown.
-  2. In the new-password field, accept Dashlane's "Generate strong password"
+  1. Check you're logged in as the RIGHT account (shown below per entry) —
+     log out first if the browser session belongs to someone else.
+  2. In the current-password field, pick that login from Dashlane's dropdown.
+  3. In the new-password field, accept Dashlane's "Generate strong password"
      suggestion — it fills both fields and remembers the value.
-  3. Submit, then accept Dashlane's prompt to update the saved password.
+  4. Submit, then accept Dashlane's prompt to update the saved password.
 Then mark the entry [d]one here. Changes are verified against the vault at
 the end of the session.
 """
+
+
+def domain_of(url):
+    base = site_url(url)
+    if not base:
+        return None
+    netloc = urllib.parse.urlparse(base).netloc.lower()
+    return netloc[4:] if netloc.startswith("www.") else netloc
 
 
 def cmd_fix(args):
@@ -383,11 +395,22 @@ def cmd_fix(args):
     print(f"{len(flagged)} credential(s) to rotate, most-used first.\n")
     print(FIX_INSTRUCTIONS)
 
+    # Map domain -> all vault logins, to warn when a site has several accounts.
+    domain_logins = {}
+    for r in rows:
+        d = domain_of(r["url"])
+        if d and r["login"]:
+            domain_logins.setdefault(d, set()).add(r["login"])
+
     done_ids = []
     for i, r in enumerate(flagged, 1):
-        print(f"[{i}/{len(flagged)}] {r['title']} — {r['login']}")
+        print(f"[{i}/{len(flagged)}] {r['title']} — CHANGE ACCOUNT: {r['login']}")
         print(f"    last used: {last_used_label(r)}, {r['number_use']} times")
         print(f"    problem: {suggestion_for(r)}")
+        others = domain_logins.get(domain_of(r["url"]), set()) - {r["login"]}
+        if others:
+            print(f"    ⚠ this domain has other vault logins ({', '.join(sorted(others))})")
+            print(f"      — the browser may be signed into one of those; check before changing")
         url = change_password_url(r["url"])
         if url:
             open_in_browser(url)
