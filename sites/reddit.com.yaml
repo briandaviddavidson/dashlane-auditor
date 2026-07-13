@@ -1,0 +1,13 @@
+change_url: https://www.reddit.com/settings/account
+steps:
+  - action: click
+    text: Change password
+  - action: fill_current
+    selector: 'input[name="current_password"]'
+  - action: fill_new
+    selector: 'input[name="new_password"]'
+  - action: fill_confirm
+    selector: 'input[name="new_password_confirm"]'
+  - action: click
+    text: Save
+requires_2fa: false

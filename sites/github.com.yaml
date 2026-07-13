@@ -1,0 +1,13 @@
+change_url: https://github.com/settings/security
+steps:
+  - action: click
+    text: Change password
+  - action: fill_current
+    selector: "#user_old_password"
+  - action: fill_new
+    selector: "#user_new_password"
+  - action: fill_confirm
+    selector: "#user_new_password_confirmation"
+  - action: click
+    text: Update password
+requires_2fa: true

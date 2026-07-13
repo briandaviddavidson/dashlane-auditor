@@ -1,0 +1,21 @@
+{
+  "github.com": "https://github.com/settings/security",
+  "google.com": "https://myaccount.google.com/security",
+  "amazon.com": "https://www.amazon.com/ap/cnep",
+  "microsoft.com": "https://account.microsoft.com/security",
+  "live.com": "https://account.microsoft.com/security",
+  "outlook.com": "https://account.microsoft.com/security",
+  "apple.com": "https://appleid.apple.com/account/manage",
+  "icloud.com": "https://appleid.apple.com/account/manage",
+  "facebook.com": "https://accountscenter.facebook.com/password_and_security",
+  "twitter.com": "https://twitter.com/settings/password",
+  "x.com": "https://x.com/settings/password",
+  "linkedin.com": "https://www.linkedin.com/mypreferences/d/change-password",
+  "reddit.com": "https://www.reddit.com/settings/account",
+  "dropbox.com": "https://www.dropbox.com/account/security",
+  "paypal.com": "https://www.paypal.com/myaccount/security/password/change",
+  "netflix.com": "https://www.netflix.com/password",
+  "spotify.com": "https://www.spotify.com/account/change-password",
+  "instagram.com": "https://accountscenter.instagram.com/password_and_security",
+  "yahoo.com": "https://login.yahoo.com/account/security"
+}

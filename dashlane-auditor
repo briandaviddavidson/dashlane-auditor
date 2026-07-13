@@ -2,7 +2,7 @@
 """dashlane-auditor — audit and rotate stale Dashlane passwords.
 
 Commands:
-    audit   Scan the vault and write a markdown document of suggestions.
+    audit   Scan the vault and write a report of suggestions (markdown or JSON).
     fix     Walk through flagged credentials one by one: opens each site's
             change-password page (use Dashlane's own overlay to fill the
             current password and generate the new one), and verifies each
@@ -15,6 +15,7 @@ memory only — they are never printed, logged, or written to disk.
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -22,8 +23,9 @@ import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from pathlib import Path
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 
 DATE_FIELDS = [
     "modificationDatetime",
@@ -34,6 +36,82 @@ DATE_FIELDS = [
 
 # Below this Dashlane strength score (0-100), a password counts as weak.
 WEAK_STRENGTH = 60
+
+CONFIG_DIR = Path.home() / ".dashlane-auditor"
+PROGRESS_FILE = CONFIG_DIR / "progress.json"
+USER_SITES_FILE = CONFIG_DIR / "sites.json"
+USER_RECIPES_DIR = CONFIG_DIR / "sites"
+
+
+# ---------------------------------------------------------------- paths / I/O
+
+def package_dir():
+    """Directory containing bundled sites.json, assist.py, and recipes."""
+    local = Path(__file__).resolve().parent
+    if (local / "sites.json").exists():
+        return local
+    for candidate in (
+        Path("/opt/homebrew/share/dashlane-auditor"),
+        Path("/usr/local/share/dashlane-auditor"),
+        Path.home() / ".local/share/dashlane-auditor",
+    ):
+        if (candidate / "sites.json").exists():
+            return candidate
+    return local
+
+
+def recipe_dirs():
+    dirs = []
+    bundled = package_dir() / "sites"
+    if bundled.is_dir():
+        dirs.append(bundled)
+    if USER_RECIPES_DIR.is_dir():
+        dirs.append(USER_RECIPES_DIR)
+    return dirs
+
+
+def load_sites_db():
+    """Merge bundled and user change-password URL mappings (user wins)."""
+    db = {}
+    bundled = package_dir() / "sites.json"
+    if bundled.is_file():
+        with open(bundled) as f:
+            db.update(json.load(f))
+    if USER_SITES_FILE.is_file():
+        with open(USER_SITES_FILE) as f:
+            db.update(json.load(f))
+    return {k.lower(): v for k, v in db.items()}
+
+
+def load_progress():
+    if not PROGRESS_FILE.is_file():
+        return None
+    with open(PROGRESS_FILE) as f:
+        return json.load(f)
+
+
+def save_progress(data):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def clear_progress():
+    if PROGRESS_FILE.is_file():
+        PROGRESS_FILE.unlink()
+
+
+def progress_filter_key(only):
+    return only or "all"
+
+
+def should_skip_entry(cred_id, progress, only):
+    if not progress:
+        return False
+    if progress.get("filter") != progress_filter_key(only):
+        return False
+    return cred_id in progress.get("done_ids", []) or cred_id in progress.get("skipped_ids", [])
 
 
 # ---------------------------------------------------------------- vault I/O
@@ -51,6 +129,25 @@ def fetch_credentials():
     except subprocess.CalledProcessError as e:
         sys.exit(f"dcli failed (are you logged in? run `dcli sync` in a terminal):\n{e.stderr}")
     return json.loads(proc.stdout)
+
+
+def fetch_password_for_entry(title, login):
+    """Retrieve a single vault password via dcli without printing it."""
+    filters = []
+    if title:
+        filters.append(f"title={title}")
+    if login:
+        filters.append(f"login={login}")
+    try:
+        proc = subprocess.run(
+            ["dcli", "password", "-f", "password", "-o", "console", *filters],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return proc.stdout.strip() or None
 
 
 def parse_timestamp(value):
@@ -154,6 +251,7 @@ def analyze(creds, stale_days, dead_days, check_breaches=True):
     rows = []
     for cred in creds:
         password = cred.get("password") or ""
+        strength = parse_int(cred.get("strength"))
         pw_hash = hashlib.sha256(password.encode()).hexdigest() if password else None
         if pw_hash:
             hash_counts[pw_hash] += 1
@@ -171,9 +269,9 @@ def analyze(creds, stale_days, dead_days, check_breaches=True):
             "last_use": last_use,
             "use_days": (now - last_use).days if last_use else None,
             "number_use": parse_int(cred.get("numberUse")) or 0,
+            "strength": strength,
             "pw_hash": pw_hash,
-            "weak": password_strength_issues(password, parse_int(cred.get("strength")))
-                    if password else [],
+            "weak": password_strength_issues(password, strength) if password else [],
             "no_password": not password,
         })
 
@@ -204,6 +302,19 @@ def analyze(creds, stale_days, dead_days, check_breaches=True):
     return rows
 
 
+def apply_only_filter(rows, only):
+    """Narrow flagged rows to a specific issue type."""
+    if not only:
+        return [r for r in rows if r["flagged"]]
+    if only == "weak":
+        return [r for r in rows if r["flagged"] and r["weak"]]
+    if only == "breached":
+        return [r for r in rows if r["flagged"] and r["breached"]]
+    if only == "reused":
+        return [r for r in rows if r["flagged"] and r["reused"]]
+    raise ValueError(f"unknown filter: {only}")
+
+
 def rotation_order(rows):
     """Most-recently / most-heavily used first — fix what you actually use."""
     return sorted(
@@ -230,10 +341,19 @@ def site_url(url):
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def change_password_url(url):
-    """Deep link to the change-password page if the site supports the
-    .well-known convention; otherwise the site itself. Sites that don't
-    support it 403/404 (or bot-block) the probe, so check before using."""
+def domain_of(url):
+    base = site_url(url)
+    if not base:
+        return None
+    netloc = urllib.parse.urlparse(base).netloc.lower()
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def change_password_url(url, sites_db):
+    """Best-effort deep link to a site's change-password page."""
+    domain = domain_of(url)
+    if domain and domain in sites_db:
+        return sites_db[domain]
     base = site_url(url)
     if not base:
         return None
@@ -271,10 +391,34 @@ def last_used_label(row):
     return f"{row['last_use'].date()} ({row['use_days']}d ago)"
 
 
+def row_to_json(row):
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "url": row["url"],
+        "login": row["login"],
+        "changed": row["changed"].isoformat() if row["changed"] else None,
+        "age_days": row["age_days"],
+        "last_use": row["last_use"].isoformat() if row["last_use"] else None,
+        "use_days": row["use_days"],
+        "number_use": row["number_use"],
+        "strength": row["strength"],
+        "weak": row["weak"],
+        "reused": row["reused"],
+        "breached": row["breached"],
+        "stale": row["stale"],
+        "dead": row["dead"],
+        "flagged": row["flagged"],
+        "problem": suggestion_for(row),
+        "change_password_url": change_password_url(row["url"], load_sites_db()),
+    }
+
+
 def cmd_audit(args):
     rows = analyze(fetch_credentials(), args.days, args.dead_days,
                    check_breaches=not args.no_breach_check)
-    flagged = rotation_order([r for r in rows if r["flagged"]])
+    sites_db = load_sites_db()
+    flagged = rotation_order(apply_only_filter(rows, args.only))
     dead = sorted(
         (r for r in rows if r["dead"]),
         key=lambda r: (r["use_days"] if r["use_days"] is not None else 10**6),
@@ -282,19 +426,46 @@ def cmd_audit(args):
     )
     now = datetime.now(timezone.utc)
 
+    if args.format == "json":
+        breach_checked = any(r["breached"] is not None for r in rows)
+        payload = {
+            "generated_at": now.isoformat(),
+            "filter": args.only or "all",
+            "summary": {
+                "credentials_scanned": len(rows),
+                "needing_rotation": len(flagged),
+                "breached_in_rotation_queue": sum(1 for r in flagged if r["breached"]),
+                "breach_check_available": breach_checked,
+                "likely_dead": len(dead),
+                "stale_but_strong": sum(
+                    1 for r in rows
+                    if r["stale"] and not r["flagged"] and not r["dead"]
+                ),
+            },
+            "flagged": [row_to_json(r) for r in flagged],
+            "dead": [row_to_json(r) for r in dead],
+        }
+        report = json.dumps(payload, indent=2) + "\n"
+        with open(args.output, "w") as f:
+            f.write(report)
+        print(report)
+        print(f"Wrote {args.output}", file=sys.stderr)
+        return
+
     breach_checked = any(r["breached"] is not None for r in rows)
     n_breached = sum(1 for r in flagged if r["breached"])
     n_stale_only = sum(
         1 for r in rows
         if r["stale"] and not r["flagged"] and not r["dead"]
     )
+    filter_note = f" (filter: {args.only})" if args.only else ""
 
     lines = [
         f"# Dashlane password audit — {now.date()}",
         "",
         f"Credentials scanned: **{len(rows)}**",
         "",
-        f"- Needing rotation (breached / reused / weak): **{len(flagged)}**",
+        f"- Needing rotation{filter_note}: **{len(flagged)}**",
         f"  - of which found in known breaches: "
         f"**{n_breached if breach_checked else 'unknown — breach check unavailable'}**",
         f"- Likely dead accounts: **{len(dead)}** (unused for {args.dead_days}+ days)",
@@ -317,7 +488,7 @@ def cmd_audit(args):
             "|---|------|-------|-----------|---------|-----------------|",
         ]
         for i, r in enumerate(flagged, 1):
-            link = site_url(r["url"])
+            link = change_password_url(r["url"], sites_db)
             link_md = f"[open]({link})" if link else "—"
             lines.append(
                 f"| {i} | {r['title']} | {r['login']} | {last_used_label(r)} "
@@ -359,7 +530,13 @@ def cmd_audit(args):
 # ---------------------------------------------------------------------- fix
 
 def open_in_browser(url):
-    subprocess.run(["open", url], check=False)
+    if sys.platform == "darwin":
+        subprocess.run(["open", url], check=False)
+    elif sys.platform == "win32":
+        subprocess.run(["cmd", "/c", "start", "", url], check=False)
+    else:
+        opener = shutil.which("xdg-open") or "xdg-open"
+        subprocess.run([opener, url], check=False)
 
 
 FIX_INSTRUCTIONS = """\
@@ -374,66 +551,139 @@ Then mark the entry [d]one here. Changes are verified against the vault at
 the end of the session.
 """
 
+ASSIST_INSTRUCTIONS = """\
+Assist mode uses Playwright to fill change-password forms when possible.
+You still need to confirm Dashlane saved the new password in your vault.
+Install once: pip install -r requirements-optional.txt && playwright install chromium
+For logged-in sessions, pass --profile pointing at your Chrome user-data dir.
+"""
 
-def domain_of(url):
-    base = site_url(url)
-    if not base:
+
+def load_assist():
+    pkg = package_dir()
+    if str(pkg) not in sys.path:
+        sys.path.insert(0, str(pkg))
+    try:
+        from assist import run_assist
+        return run_assist
+    except ImportError:
         return None
-    netloc = urllib.parse.urlparse(base).netloc.lower()
-    return netloc[4:] if netloc.startswith("www.") else netloc
 
 
 def cmd_fix(args):
     rows = analyze(fetch_credentials(), args.days, args.dead_days,
                    check_breaches=not args.no_breach_check)
-    flagged = rotation_order([r for r in rows if r["flagged"]])
+    flagged = rotation_order(apply_only_filter(rows, args.only))
     if not flagged:
         print("Nothing to fix — vault looks healthy.")
         print("(Likely dead accounts are excluded; see `dashlane-auditor audit`.)")
         return
 
-    print(f"{len(flagged)} credential(s) to rotate, most-used first.\n")
-    print(FIX_INSTRUCTIONS)
+    sites_db = load_sites_db()
+    progress = None if args.no_resume else load_progress()
+    if progress and progress.get("filter") != progress_filter_key(args.only):
+        print(f"Note: saved progress is for filter={progress.get('filter')}; "
+              f"starting fresh for filter={progress_filter_key(args.only)}.")
+        progress = None
+    if args.no_resume:
+        clear_progress()
 
-    # Map domain -> all vault logins, to warn when a site has several accounts.
+    pending = [r for r in flagged if not should_skip_entry(r["id"], progress, args.only)]
+    skipped_by_resume = len(flagged) - len(pending)
+
+    print(f"{len(pending)} credential(s) to rotate"
+          f"{f' ({skipped_by_resume} already done/skipped from last session)' if skipped_by_resume else ''}"
+          f"{f', filter={args.only}' if args.only else ''}, most-used first.\n")
+    print(ASSIST_INSTRUCTIONS if args.assist else FIX_INSTRUCTIONS)
+
+    snapshot = {r["id"]: {"strength": r["strength"], "age_days": r["age_days"]}
+                for r in flagged}
+
     domain_logins = {}
     for r in rows:
         d = domain_of(r["url"])
         if d and r["login"]:
             domain_logins.setdefault(d, set()).add(r["login"])
 
-    done_ids = []
-    for i, r in enumerate(flagged, 1):
-        print(f"[{i}/{len(flagged)}] {r['title']} — CHANGE ACCOUNT: {r['login']}")
+    session = progress or {
+        "version": 1,
+        "filter": progress_filter_key(args.only),
+        "done_ids": [],
+        "skipped_ids": [],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    run_assist = load_assist() if args.assist else None
+    profile_dir = Path(args.profile).expanduser() if args.profile else None
+
+    done_ids = list(session.get("done_ids", []))
+    for i, r in enumerate(pending, 1):
+        print(f"[{i}/{len(pending)}] {r['title']} — CHANGE ACCOUNT: {r['login']}")
         print(f"    last used: {last_used_label(r)}, {r['number_use']} times")
         print(f"    problem: {suggestion_for(r)}")
         others = domain_logins.get(domain_of(r["url"]), set()) - {r["login"]}
         if others:
             print(f"    ⚠ this domain has other vault logins ({', '.join(sorted(others))})")
             print(f"      — the browser may be signed into one of those; check before changing")
-        url = change_password_url(r["url"])
-        if url:
-            open_in_browser(url)
-            deep = "/.well-known/" in url
-            print(f"    opened {url}" +
-                  ("" if deep else "  (no change-password deep link; go to account/security settings)"))
-        else:
-            print("    no URL on this entry — open the site manually")
+
+        url = change_password_url(r["url"], sites_db)
+        assisted = False
+        if args.assist and url and run_assist:
+            current_password = fetch_password_for_entry(r["title"], r["login"])
+            if current_password:
+                status, _new_pw = run_assist(
+                    url=url,
+                    domain=domain_of(r["url"]),
+                    current_password=current_password,
+                    recipe_dirs=recipe_dirs(),
+                    profile_dir=profile_dir,
+                    headless=args.headless,
+                )
+                if status == "ok":
+                    assisted = True
+                    print("    assist submitted the form — accept Dashlane's save prompt,")
+                    print("    or copy the new password from the browser and update the vault entry")
+                else:
+                    print("    assist could not complete this site; falling back to manual flow")
+            else:
+                print("    could not fetch current password from vault; falling back to manual flow")
+
+        if not assisted:
+            if url:
+                open_in_browser(url)
+                deep = url in sites_db.values() or "/.well-known/" in url
+                print(f"    opened {url}" +
+                      ("" if deep else "  (no change-password deep link; go to account/security settings)"))
+            else:
+                print("    no URL on this entry — open the site manually")
 
         choice = input("    [d]one / [s]kip / [q]uit: ").strip().lower()
         if choice == "d":
-            done_ids.append(r["id"])
+            if r["id"] not in done_ids:
+                done_ids.append(r["id"])
+            session["done_ids"] = done_ids
+            save_progress(session)
+        elif choice == "s":
+            skipped = session.setdefault("skipped_ids", [])
+            if r["id"] not in skipped:
+                skipped.append(r["id"])
+            save_progress(session)
         elif choice == "q":
+            save_progress(session)
             break
+        else:
+            save_progress(session)
         print()
 
     if done_ids:
-        verify(done_ids, args.days, args.dead_days)
+        verify(done_ids, args.days, args.dead_days, snapshot)
+        if len(done_ids) == len(flagged):
+            clear_progress()
+            print("All entries processed — progress cleared.")
     else:
         print("No entries marked done.")
 
 
-def verify(done_ids, stale_days, dead_days):
+def verify(done_ids, stale_days, dead_days, snapshot):
     """Re-fetch the vault and confirm the changed entries actually updated."""
     print(f"\nVerifying {len(done_ids)} change(s) against the vault...")
     subprocess.run(["dcli", "sync"], capture_output=True, text=True)
@@ -442,10 +692,28 @@ def verify(done_ids, stale_days, dead_days):
                              check_breaches=False)}
     for cred_id in done_ids:
         r = rows.get(cred_id)
+        before = snapshot.get(cred_id, {})
         if r is None:
             print(f"  ? entry {cred_id} no longer found")
-        elif r["age_days"] is not None and r["age_days"] <= 1:
-            print(f"  ✓ {r['title']} — vault entry updated")
+            continue
+
+        strength_ok = (
+            r["strength"] is not None
+            and (
+                (before.get("strength") is not None and r["strength"] > before["strength"])
+                or r["strength"] >= WEAK_STRENGTH
+            )
+        )
+        recent_change = r["age_days"] is not None and r["age_days"] <= 1
+
+        if strength_ok:
+            detail = f"strength now {r['strength']}/100"
+            if before.get("strength") is not None:
+                detail = f"strength {before['strength']} → {r['strength']}/100"
+            print(f"  ✓ {r['title']} — vault entry updated ({detail})")
+        elif recent_change:
+            print(f"  ✓ {r['title']} — vault entry recently modified "
+                  f"(strength unchanged at {r['strength']}/100)")
         else:
             print(f"  ✗ {r['title']} — vault entry NOT updated; make sure the "
                   "Dashlane extension saved the new password, or update it manually")
@@ -463,6 +731,8 @@ def add_common_args(parser):
     parser.add_argument("--no-breach-check", action="store_true",
                         help="skip the HaveIBeenPwned check (k-anonymity: only "
                              "5-char hash prefixes are ever sent)")
+    parser.add_argument("--only", choices=["weak", "breached", "reused"],
+                        help="limit rotation queue to a single issue type")
 
 
 def main():
@@ -474,17 +744,29 @@ def main():
     ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
 
-    p_audit = sub.add_parser("audit", help="write a markdown report of suggested fixes")
+    p_audit = sub.add_parser("audit", help="write a report of suggested fixes")
     add_common_args(p_audit)
     p_audit.add_argument("-o", "--output", default="dashlane-audit.md",
-                         help="markdown output file (default dashlane-audit.md)")
+                         help="output file (default dashlane-audit.md)")
+    p_audit.add_argument("--format", choices=["md", "json"], default="md",
+                         help="report format (default md)")
     p_audit.set_defaults(func=cmd_audit)
 
     p_fix = sub.add_parser("fix", help="interactively rotate flagged passwords")
     add_common_args(p_fix)
+    p_fix.add_argument("--no-resume", action="store_true",
+                       help="ignore saved progress and start fresh (default is to resume)")
+    p_fix.add_argument("--assist", action="store_true",
+                       help="use Playwright to fill change-password forms when possible")
+    p_fix.add_argument("--profile",
+                       help="Chrome user-data directory for assist mode (keeps logins)")
+    p_fix.add_argument("--headless", action="store_true",
+                       help="run assist browser headless (usually worse for 2FA)")
     p_fix.set_defaults(func=cmd_fix)
 
     args = ap.parse_args()
+    if args.command == "audit" and args.format == "json" and not args.output.endswith(".json"):
+        args.output = "dashlane-audit.json"
     args.func(args)
 
 

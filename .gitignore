@@ -1,7 +1,8 @@
 # Generated audit reports (contain site/login metadata)
 report*.md
 dashlane-audit*.md
-*.json
+dashlane-audit*.json
+report*.json
 *.csv
 
 .DS_Store

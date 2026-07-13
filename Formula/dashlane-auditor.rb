@@ -1,8 +1,8 @@
 class DashlaneAuditor < Formula
   desc "Audit and rotate stale Dashlane passwords"
   homepage "https://github.com/briandaviddavidson/dashlane-auditor"
-  url "https://github.com/briandaviddavidson/dashlane-auditor/archive/refs/tags/v0.4.1.tar.gz"
-  sha256 "f07e21155c4c569e16026cf4dc4d9483e286a11200ccc44814d9e24e24fb64cc"
+  url "https://github.com/briandaviddavidson/dashlane-auditor/archive/refs/tags/v0.5.0.tar.gz"
+  sha256 "UPDATE_ON_RELEASE"
   license "MIT"
 
   include Language::Python::Shebang
@@ -13,6 +13,8 @@ class DashlaneAuditor < Formula
   def install
     bin.install "dashlane-auditor"
     rewrite_shebang detected_python_shebang, bin/"dashlane-auditor"
+    pkgshare.install "assist.py", "sites.json"
+    (pkgshare/"sites").install Dir["sites/*.yaml"]
   end
 
   test do
