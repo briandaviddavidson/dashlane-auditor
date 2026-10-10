@@ -2,7 +2,7 @@ class DashlaneAuditor < Formula
   desc "Audit and rotate stale Dashlane passwords"
   homepage "https://github.com/briandaviddavidson/dashlane-auditor"
   url "https://github.com/briandaviddavidson/dashlane-auditor/archive/refs/tags/v0.5.0.tar.gz"
-  sha256 "UPDATE_ON_RELEASE"
+  sha256 "6e244696788e0e7dc7c8ae01221c06702931961afaa6dd7919b1f372a4dbcee4"
   license "MIT"
 
   include Language::Python::Shebang
