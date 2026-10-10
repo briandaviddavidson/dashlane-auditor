@@ -10,6 +10,7 @@ from __future__ import annotations
 import secrets
 import string
 import sys
+import urllib.parse
 from pathlib import Path
 
 
@@ -123,6 +124,34 @@ def run_generic(page, current_password, new_password):
     return submit_password_form(page)
 
 
+def host_allowed(page_url, opened_url, domain):
+    """True if page_url is on the site we meant to open.
+
+    Guards against filling the current password into a page we were
+    redirected to on another domain. Subdomains of the vault entry's domain
+    or of the opened URL's host count (e.g. accounts.google.com for
+    google.com).
+    """
+    host = (urllib.parse.urlparse(page_url).hostname or "").lower()
+    if not host:
+        return False
+    allowed = {(domain or "").lower(),
+               (urllib.parse.urlparse(opened_url).hostname or "").lower()}
+    allowed = {a[4:] if a.startswith("www.") else a for a in allowed if a}
+    return any(host == a or host.endswith("." + a) for a in allowed)
+
+
+def confirm_site_accepted():
+    """Ask the user whether the site accepted the new password."""
+    while True:
+        answer = input("    Check the browser: did the site accept the new password? "
+                       "[y]es / [n]o: ").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+
+
 def pause_for_2fa(recipe):
     if recipe and recipe.get("requires_2fa"):
         input("    Complete 2FA on the page, then press Enter to continue... ")
@@ -143,9 +172,11 @@ def run_assist(
     """Open url and attempt an assisted password change.
 
     Returns (status, new_password) where status is one of:
-        "ok"       — form submitted; user should confirm Dashlane saved it
+        "ok"       — the user confirmed the site accepted new_password; the
+                     caller must get it into the vault
+        "rejected" — the form was submitted but the user says the site did
+                     not accept it, so the old password still applies
         "fallback" — could not automate; caller should use manual flow
-        "error"    — unexpected failure
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -156,6 +187,7 @@ def run_assist(
 
     new_password = generate_password()
     recipe = load_recipe(domain, recipe_dirs)
+    submitted = False
 
     try:
         with sync_playwright() as p:
@@ -172,27 +204,44 @@ def run_assist(
                 context = browser.new_context()
                 page = context.new_page()
 
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1500)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
 
-            if recipe:
-                run_recipe(page, recipe, current_password, new_password)
-            elif not run_generic(page, current_password, new_password):
+                if not host_allowed(page.url, url, domain):
+                    print(f"    assist stopped: page is on {page.url}, not {domain}; "
+                          "not filling passwords there", file=sys.stderr)
+                    return "fallback", None
+
+                if recipe:
+                    run_recipe(page, recipe, current_password, new_password)
+                    submitted = True
+                elif run_generic(page, current_password, new_password):
+                    submitted = True
+                else:
+                    return "fallback", None
+
+                page.wait_for_timeout(2000)
+                if recipe and recipe.get("requires_2fa"):
+                    pause_for_2fa(recipe)
+                elif any(token in page.url.lower() for token in ("challenge", "verify", "2fa", "mfa")):
+                    input("    Possible 2FA/verification step — complete it, then press Enter... ")
+
+                # Ask while the browser is still open so the user can see the
+                # site's confirmation or error message.
+                if confirm_site_accepted():
+                    return "ok", new_password
+                return "rejected", None
+            finally:
                 context.close()
                 if browser:
                     browser.close()
-                return "fallback", None
-
-            page.wait_for_timeout(2000)
-            if recipe and recipe.get("requires_2fa"):
-                pause_for_2fa(recipe)
-            elif any(token in page.url.lower() for token in ("challenge", "verify", "2fa", "mfa")):
-                input("    Possible 2FA/verification step — complete it, then press Enter... ")
-
-            context.close()
-            if browser:
-                browser.close()
-            return "ok", new_password
     except Exception as e:
         print(f"    assist error ({e.__class__.__name__}): {e}", file=sys.stderr)
+        if submitted:
+            # The form may have gone through before the error. Let the user
+            # decide rather than silently dropping the new password.
+            if confirm_site_accepted():
+                return "ok", new_password
+            return "rejected", None
         return "fallback", None
