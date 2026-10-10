@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -333,7 +334,8 @@ def site_url(url):
     if "://" not in url:
         url = "https://" + url
     parsed = urllib.parse.urlparse(url)
-    if not parsed.netloc:
+    # Skip app entries (android://, etc.) and anything that isn't a website.
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
     return f"{parsed.scheme}://{parsed.netloc}"
 
@@ -346,8 +348,17 @@ def domain_of(url):
     return netloc[4:] if netloc.startswith("www.") else netloc
 
 
+_change_url_cache = {}
+
+
 def change_password_url(url, sites_db):
     """Best-effort deep link to a site's change-password page."""
+    if url not in _change_url_cache:
+        _change_url_cache[url] = _lookup_change_password_url(url, sites_db)
+    return _change_url_cache[url]
+
+
+def _lookup_change_password_url(url, sites_db):
     domain = domain_of(url)
     if domain and domain in sites_db:
         return sites_db[domain]
@@ -382,13 +393,18 @@ def suggestion_for(row):
     return "; ".join(reasons)
 
 
+def md_cell(value):
+    """Make a value safe inside a markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
 def last_used_label(row):
     if row["last_use"] is None:
         return "never (untracked)"
     return f"{row['last_use'].date()} ({row['use_days']}d ago)"
 
 
-def row_to_json(row):
+def row_to_json(row, sites_db):
     return {
         "id": row["id"],
         "title": row["title"],
@@ -407,7 +423,7 @@ def row_to_json(row):
         "dead": row["dead"],
         "flagged": row["flagged"],
         "problem": suggestion_for(row),
-        "change_password_url": change_password_url(row["url"], load_sites_db()),
+        "change_password_url": change_password_url(row["url"], sites_db),
     }
 
 
@@ -439,8 +455,8 @@ def cmd_audit(args):
                     if r["stale"] and not r["flagged"] and not r["dead"]
                 ),
             },
-            "flagged": [row_to_json(r) for r in flagged],
-            "dead": [row_to_json(r) for r in dead],
+            "flagged": [row_to_json(r, sites_db) for r in flagged],
+            "dead": [row_to_json(r, sites_db) for r in dead],
         }
         report = json.dumps(payload, indent=2) + "\n"
         with open(args.output, "w") as f:
@@ -488,8 +504,8 @@ def cmd_audit(args):
             link = change_password_url(r["url"], sites_db)
             link_md = f"[open]({link})" if link else "—"
             lines.append(
-                f"| {i} | {r['title']} | {r['login']} | {last_used_label(r)} "
-                f"| {suggestion_for(r)} | {link_md} |"
+                f"| {i} | {md_cell(r['title'])} | {md_cell(r['login'])} | {last_used_label(r)} "
+                f"| {md_cell(suggestion_for(r))} | {link_md} |"
             )
         lines += [
             "",
@@ -512,7 +528,7 @@ def cmd_audit(args):
         for i, r in enumerate(dead, 1):
             breached = f"{r['breached']:,}×" if r["breached"] else ""
             lines.append(
-                f"| {i} | {r['title']} | {r['login']} | {last_used_label(r)} "
+                f"| {i} | {md_cell(r['title'])} | {md_cell(r['login'])} | {last_used_label(r)} "
                 f"| {r['number_use']} | {breached} | {'yes' if r['reused'] else ''} |"
             )
         lines.append("")
@@ -530,7 +546,7 @@ def open_in_browser(url):
     if sys.platform == "darwin":
         subprocess.run(["open", url], check=False)
     elif sys.platform == "win32":
-        subprocess.run(["cmd", "/c", "start", "", url], check=False)
+        os.startfile(url)  # avoids cmd.exe interpreting & and ^ in URLs
     else:
         opener = shutil.which("xdg-open") or "xdg-open"
         subprocess.run([opener, url], check=False)
@@ -813,8 +829,9 @@ def main():
 
     p_audit = sub.add_parser("audit", help="write a report of suggested fixes")
     add_common_args(p_audit)
-    p_audit.add_argument("-o", "--output", default="dashlane-audit.md",
-                         help="output file (default dashlane-audit.md)")
+    p_audit.add_argument("-o", "--output",
+                         help="output file (default dashlane-audit.md, or "
+                              "dashlane-audit.json with --format json)")
     p_audit.add_argument("--format", choices=["md", "json"], default="md",
                          help="report format (default md)")
     p_audit.set_defaults(func=cmd_audit)
@@ -832,8 +849,8 @@ def main():
     p_fix.set_defaults(func=cmd_fix)
 
     args = ap.parse_args()
-    if args.command == "audit" and args.format == "json" and not args.output.endswith(".json"):
-        args.output = "dashlane-audit.json"
+    if args.command == "audit" and not args.output:
+        args.output = "dashlane-audit.json" if args.format == "json" else "dashlane-audit.md"
     args.func(args)
 
 
